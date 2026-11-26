@@ -12,7 +12,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install shellcheck
         run: |
           if [ "$RUNNER_OS" = macOS ]; then brew install shellcheck; else sudo apt-get install -y shellcheck; fi
@@ -25,7 +25,7 @@ jobs:
     name: PowerShell scripts (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Parse scripts
         shell: pwsh
         run: |
@@ -38,7 +38,7 @@ jobs:
         shell: pwsh
         run: |
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-          $r = Invoke-ScriptAnalyzer -Path bin/ollama-claude.ps1, install/install.ps1 -Severity Error
+          $r = foreach ($f in 'bin/ollama-claude.ps1', 'install/install.ps1') { Invoke-ScriptAnalyzer -Path $f -Severity Error }
           if ($r) { $r | Format-Table; throw 'PSScriptAnalyzer errors' }
       - name: Launcher smoke tests
         shell: pwsh
@@ -60,7 +60,7 @@ jobs:
     name: Docker image + compose
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Validate compose files
         run: docker compose -f docker-compose.yml -f docker-compose.gpu.yml config -q
       - name: Build image
