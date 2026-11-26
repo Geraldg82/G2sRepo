@@ -151,3 +151,7 @@ shellcheck -S warning bin/ollama-claude install/install.sh docker/entrypoint.sh 
 
 CI runs the tests on Linux and macOS, checks the PowerShell scripts on Windows,
 and builds the Docker image.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
