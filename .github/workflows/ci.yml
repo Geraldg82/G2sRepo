@@ -50,7 +50,7 @@ jobs:
           if ($out -notmatch "ANTHROPIC_BASE_URL = 'http://localhost:11434'" -or $out -notmatch 'claude --model qwen3.5') { throw "dry run: $out" }
           $env:OLLAMA_API_KEY = 'sk-test'
           $out = ./bin/ollama-claude.ps1 -Cloud -Model glm-5.3-flash:cloud -DryRun | Out-String
-          if ($out -match 'sk-test' -or $out -notmatch 'https://ollama.com' -or $out -notmatch 'claude --model glm-5.3-flash$') { throw "cloud dry run: $out" }
+          if ($out -match 'sk-test' -or $out -notmatch 'https://ollama.com' -or $out -notmatch 'claude --model glm-5.3-flash\s*$') { throw "cloud dry run: $out" }
           $env:OLLAMA_HOST = '0.0.0.0'
           $out = ./bin/ollama-claude.ps1 -Command config | Out-String
           if ($out -notmatch 'HOST=http://localhost:11434') { throw "host normalisation: $out" }
