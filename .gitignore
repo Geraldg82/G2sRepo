@@ -1,0 +1,5 @@
+workspace/*
+!workspace/.gitkeep
+.ccr-ca.crt
+*.log
+.DS_Store

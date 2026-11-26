@@ -1,0 +1,46 @@
+# Ollama + Claude Code in containers.
+#
+#   docker compose run --rm claude              # interactive Claude Code on ./workspace
+#   WORKSPACE=~/code/myproj docker compose run --rm claude
+#   OLLAMA_CLAUDE_MODEL=qwen3-coder docker compose run --rm claude
+#   docker compose run --rm claude -p "summarize this repo"   # one-shot
+#
+# NVIDIA GPU: add  -f docker-compose.gpu.yml  to every command.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-65536}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  claude:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    depends_on:
+      ollama:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_CLAUDE_MODEL: ${OLLAMA_CLAUDE_MODEL:-qwen3.5}
+    volumes:
+      - ${WORKSPACE:-./workspace}:/workspace
+      - claude-home:/home/coder/.claude
+    profiles: ["cli"]
+
+volumes:
+  ollama-models:
+  claude-home:

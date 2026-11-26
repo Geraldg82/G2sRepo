@@ -1,0 +1,17 @@
+# Copy to ~/.config/ollama-claude/config (macOS/Linux)
+# or %APPDATA%\ollama-claude\config (Windows).
+# Environment variables and command-line flags override these.
+
+# local     = Ollama on this machine (or HOST)
+# cloud     = ollama.com directly, needs OLLAMA_API_KEY
+# anthropic = plain Claude Code on Anthropic's API
+MODE=local
+
+# Default model. Local models need 64k+ context; cloud models end in :cloud.
+MODEL=qwen3.5
+
+# Ollama server. Leave empty for $OLLAMA_HOST or http://localhost:11434.
+HOST=
+
+# Context length used when ollama-claude starts the server itself.
+CTX=65536

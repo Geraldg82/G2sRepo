@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# ollama-claude: launch Claude Code against Ollama (local or cloud) or Anthropic.
+#
+#   ollama-claude                      pick a local model and launch
+#   ollama-claude -m qwen3.5           launch with a specific model
+#   ollama-claude --cloud -m glm-5.3-flash   talk to ollama.com directly
+#   ollama-claude --anthropic          plain Claude Code on Anthropic's API
+#   ollama-claude doctor               check the setup
+#   ollama-claude -- -p "explain this repo"  pass args through to claude
+
+set -euo pipefail
+
+VERSION="0.1.0"
+PROG="$(basename "$0")"
+
+CONFIG_FILE="${OLLAMA_CLAUDE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ollama-claude/config}"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ollama-claude"
+
+# Defaults; the config file and then the environment override them.
+MODEL=""
+MODE="local"          # local | cloud | anthropic
+HOST=""
+CTX="65536"
+PULL=1
+DRY_RUN=0
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+OLLAMA_BIN="${OLLAMA_BIN:-ollama}"
+START_TIMEOUT="${OLLAMA_CLAUDE_START_TIMEOUT:-20}"
+
+log()  { printf '%s\n' "$*" >&2; }
+info() { log "==> $*"; }
+warn() { log "warning: $*"; }
+die()  { log "error: $*"; exit 1; }
+
+usage() {
+  cat <<EOF
+$PROG $VERSION - launch Claude Code on Ollama models
+
+Usage:
+  $PROG [options] [-- claude-args...]
+  $PROG doctor           check Ollama, Claude Code and settings
+  $PROG models           list models available to the local Ollama server
+  $PROG config           show the effective configuration
+
+Options:
+  -m, --model NAME       model to use (e.g. qwen3.5, kimi-k2.7-code:cloud)
+      --local            use a local Ollama server (default)
+      --cloud            use ollama.com directly; needs OLLAMA_API_KEY, no local Ollama
+      --anthropic        use Anthropic's API (plain Claude Code, no Ollama)
+      --host URL         Ollama server URL (default \$OLLAMA_HOST or http://localhost:11434)
+      --ctx N            context length when this tool starts the server (default 65536)
+      --no-pull          do not pull a missing model
+  -n, --dry-run          print the environment and command instead of running it
+  -h, --help             show this help
+  -V, --version          show the version
+
+Config file: $CONFIG_FILE
+  Lines of KEY=VALUE. Keys: MODEL, MODE, HOST, CTX.
+Environment overrides: OLLAMA_CLAUDE_MODEL, OLLAMA_CLAUDE_MODE, OLLAMA_HOST,
+  OLLAMA_CLAUDE_CTX, OLLAMA_API_KEY (cloud mode), CLAUDE_BIN, OLLAMA_BIN.
+EOF
+}
+
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  local key value
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    key="${key//[[:space:]]/}"
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    value="${value%\"}"; value="${value#\"}"
+    case "$key" in
+      MODEL) MODEL="$value" ;;
+      MODE)  MODE="$value" ;;
+      HOST)  HOST="$value" ;;
+      CTX)   CTX="$value" ;;
+      *) warn "unknown key '$key' in $CONFIG_FILE" ;;
+    esac
+  done < "$CONFIG_FILE"
+}
+
+load_env() {
+  [[ -n "${OLLAMA_CLAUDE_MODEL:-}" ]] && MODEL="$OLLAMA_CLAUDE_MODEL"
+  [[ -n "${OLLAMA_CLAUDE_MODE:-}" ]]  && MODE="$OLLAMA_CLAUDE_MODE"
+  [[ -n "${OLLAMA_CLAUDE_CTX:-}" ]]   && CTX="$OLLAMA_CLAUDE_CTX"
+  [[ -z "$HOST" && -n "${OLLAMA_HOST:-}" ]] && HOST="$OLLAMA_HOST"
+  return 0
+}
+
+# OLLAMA_HOST may be "0.0.0.0", "127.0.0.1:11434" or a full URL.
+normalize_host() {
+  local h="${1:-}"
+  [[ -z "$h" ]] && h="http://localhost:11434"
+  [[ "$h" != *://* ]] && h="http://$h"
+  local scheme="${h%%://*}" rest="${h#*://}"
+  rest="${rest%%/*}"
+  [[ "$rest" == 0.0.0.0* ]] && rest="localhost${rest#0.0.0.0}"
+  [[ "$rest" != *:* ]] && rest="$rest:11434"
+  printf '%s://%s' "$scheme" "$rest"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+http_ok() { curl -fsS --max-time 3 "$1" >/dev/null 2>&1; }
+
+server_up() { http_ok "$HOST/api/version"; }
+
+is_local_host() {
+  [[ "$HOST" =~ ^https?://(localhost|127\.0\.0\.1|\[::1\])(:|$) ]]
+}
+
+start_server() {
+  have "$OLLAMA_BIN" || die "Ollama is not installed. Run install/install.sh or see https://ollama.com/download"
+  is_local_host || die "Ollama at $HOST is not reachable, and it is not on this machine so it cannot be started here"
+  mkdir -p "$LOG_DIR"
+  info "Starting Ollama (context length $CTX), log: $LOG_DIR/serve.log"
+  local hostport="${HOST#*://}"
+  OLLAMA_HOST="$hostport" OLLAMA_CONTEXT_LENGTH="$CTX" \
+    nohup "$OLLAMA_BIN" serve >>"$LOG_DIR/serve.log" 2>&1 &
+  local i
+  for ((i = 0; i < START_TIMEOUT * 2; i++)); do
+    server_up && return 0
+    sleep 0.5
+  done
+  die "Ollama did not start within ${START_TIMEOUT}s; see $LOG_DIR/serve.log"
+}
+
+local_models() {
+  # Names from /api/tags, one per line, without needing jq.
+  curl -fsS --max-time 5 "$HOST/api/tags" 2>/dev/null \
+    | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | sed 's/^"name"[[:space:]]*:[[:space:]]*"//; s/"$//' || true
+}
+
+model_present() {
+  local m="$1" name
+  [[ "$m" != *:* ]] && m="$m:latest"
+  while IFS= read -r name; do
+    [[ "$name" == "$m" || "$name" == "$1" ]] && return 0
+  done < <(local_models)
+  return 1
+}
+
+pick_model() {
+  local models=() line
+  # No mapfile: macOS ships bash 3.2.
+  while IFS= read -r line; do [[ -n "$line" ]] && models+=("$line"); done < <(local_models)
+  if ((${#models[@]} == 0)); then
+    die "no models found on $HOST. Pass one with -m, e.g. '$PROG -m qwen3.5' (it will be pulled)"
+  fi
+  if ((${#models[@]} == 1)); then
+    MODEL="${models[0]}"; return
+  fi
+  [[ -t 0 ]] || die "several models are available; pass one with -m: ${models[*]}"
+  log "Choose a model:"
+  local PS3="model number: " choice
+  select choice in "${models[@]}"; do
+    [[ -n "$choice" ]] && { MODEL="$choice"; return; }
+  done
+  die "no model chosen"
+}
+
+ensure_model() {
+  [[ "$MODEL" == *:cloud || "$MODEL" == *-cloud ]] && return 0  # runs on ollama.com
+  model_present "$MODEL" && return 0
+  ((PULL)) || die "model '$MODEL' is not available on $HOST (and --no-pull was given)"
+  have "$OLLAMA_BIN" || die "model '$MODEL' is missing and the ollama CLI is not installed to pull it"
+  info "Pulling $MODEL"
+  OLLAMA_HOST="${HOST#*://}" "$OLLAMA_BIN" pull "$MODEL"
+}
+
+warn_settings_override() {
+  local f
+  for f in "$HOME/.claude/settings.json" ".claude/settings.json" ".claude/settings.local.json"; do
+    if [[ -f "$f" ]] && grep -Eq '"ANTHROPIC_(BASE_URL|AUTH_TOKEN|API_KEY)"' "$f"; then
+      warn "$f sets ANTHROPIC_* variables, which override this launcher. Remove them if the wrong backend is used."
+    fi
+  done
+}
+
+# Fills the global ENV_VARS array with KEY=VALUE pairs for claude.
+build_env() {
+  ENV_VARS=()
+  case "$MODE" in
+    local)
+      ENV_VARS=("ANTHROPIC_BASE_URL=$HOST" "ANTHROPIC_AUTH_TOKEN=ollama" "ANTHROPIC_API_KEY=")
+      ;;
+    cloud)
+      [[ -n "${OLLAMA_API_KEY:-}" ]] || die "cloud mode needs OLLAMA_API_KEY (create one at https://ollama.com/settings/keys)"
+      ENV_VARS=("ANTHROPIC_BASE_URL=https://ollama.com" "ANTHROPIC_AUTH_TOKEN=$OLLAMA_API_KEY" "ANTHROPIC_API_KEY=")
+      ;;
+    anthropic) ;;
+    *) die "unknown mode '$MODE' (use local, cloud or anthropic)" ;;
+  esac
+}
+
+cmd_launch() {
+  case "$MODE" in
+    local)
+      if ((DRY_RUN)); then
+        server_up || warn "Ollama is not running at $HOST (dry run: not starting it)"
+        [[ -n "$MODEL" ]] || MODEL="<choose>"
+      else
+        server_up || start_server
+        [[ -n "$MODEL" ]] || pick_model
+        ensure_model
+      fi
+      ;;
+    cloud)
+      [[ -n "$MODEL" ]] || die "cloud mode needs a model; pass -m (see https://ollama.com/search?c=cloud)"
+      MODEL="${MODEL%:cloud}"
+      ;;
+  esac
+
+  build_env
+  local cmd=("$CLAUDE_BIN")
+  [[ -n "$MODEL" ]] && cmd+=(--model "$MODEL")
+  cmd+=("${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}")
+
+  if ((DRY_RUN)); then
+    local kv
+    for kv in "${ENV_VARS[@]+"${ENV_VARS[@]}"}"; do
+      [[ "$kv" == ANTHROPIC_AUTH_TOKEN=* && "$MODE" == cloud ]] && kv="ANTHROPIC_AUTH_TOKEN=<OLLAMA_API_KEY>"
+      printf '%q ' "$kv"
+    done
+    printf '%q ' "${cmd[@]}"; printf '\n'
+    return 0
+  fi
+
+  have "$CLAUDE_BIN" || die "Claude Code is not installed. Run install/install.sh or: curl -fsSL https://claude.ai/install.sh | bash"
+  warn_settings_override
+  info "Launching Claude Code (mode: $MODE${MODEL:+, model: $MODEL})"
+  exec env "${ENV_VARS[@]+"${ENV_VARS[@]}"}" "${cmd[@]}"
+}
+
+cmd_models() {
+  server_up || die "Ollama is not running at $HOST (start it with 'ollama serve')"
+  local_models
+}
+
+cmd_config() {
+  printf 'config file: %s%s\n' "$CONFIG_FILE" "$([[ -f "$CONFIG_FILE" ]] || echo ' (not present)')"
+  printf 'MODE=%s\nMODEL=%s\nHOST=%s\nCTX=%s\n' "$MODE" "$MODEL" "$HOST" "$CTX"
+}
+
+cmd_doctor() {
+  local ok=1 v
+  check() { printf '  %-4s %s\n' "$1" "$2"; [[ "$1" == FAIL ]] && ok=0; return 0; }
+  echo "ollama-claude doctor"
+  if have "$CLAUDE_BIN"; then
+    check OK "Claude Code: $("$CLAUDE_BIN" --version 2>/dev/null | head -1)"
+  else
+    check FAIL "Claude Code not found (curl -fsSL https://claude.ai/install.sh | bash)"
+  fi
+  if [[ "$MODE" == cloud ]]; then
+    [[ -n "${OLLAMA_API_KEY:-}" ]] && check OK "OLLAMA_API_KEY is set" || check FAIL "OLLAMA_API_KEY is not set"
+  elif [[ "$MODE" == local ]]; then
+    if have "$OLLAMA_BIN"; then
+      check OK "Ollama CLI: $("$OLLAMA_BIN" --version 2>/dev/null | tail -1)"
+    else
+      check WARN "Ollama CLI not found (only fine if the server runs elsewhere)"
+    fi
+    if server_up; then
+      v="$(curl -fsS --max-time 3 "$HOST/api/version" | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
+      check OK "Ollama server at $HOST, version $v"
+      local n; n="$(local_models | wc -l | tr -d ' ')"
+      ((n > 0)) && check OK "$n model(s) available" || check WARN "no models pulled yet (ollama pull qwen3.5)"
+      if [[ -n "$MODEL" ]]; then
+        { [[ "$MODEL" == *:cloud ]] || model_present "$MODEL"; } \
+          && check OK "configured model '$MODEL' is available" \
+          || check WARN "configured model '$MODEL' is not pulled yet (it will be pulled on launch)"
+      fi
+    else
+      check WARN "Ollama server not running at $HOST (it is started on launch)"
+    fi
+  fi
+  local f
+  for f in "$HOME/.claude/settings.json" ".claude/settings.json" ".claude/settings.local.json"; do
+    if [[ -f "$f" ]] && grep -Eq '"ANTHROPIC_(BASE_URL|AUTH_TOKEN|API_KEY)"' "$f"; then
+      check WARN "$f sets ANTHROPIC_* variables that override the launcher"
+    fi
+  done
+  ((ok)) && echo "All required checks passed." || { echo "Some checks failed."; return 1; }
+}
+
+main() {
+  load_config
+  load_env
+
+  local sub="launch"
+  CLAUDE_ARGS=()
+  case "${1:-}" in
+    doctor|models|config) sub="$1"; shift ;;
+  esac
+
+  while (($#)); do
+    case "$1" in
+      -m|--model) [[ $# -ge 2 ]] || die "$1 needs a value"; MODEL="$2"; shift 2 ;;
+      --model=*)  MODEL="${1#*=}"; shift ;;
+      --local)    MODE=local; shift ;;
+      --cloud)    MODE=cloud; shift ;;
+      --anthropic) MODE=anthropic; shift ;;
+      --host)     [[ $# -ge 2 ]] || die "$1 needs a value"; HOST="$2"; shift 2 ;;
+      --host=*)   HOST="${1#*=}"; shift ;;
+      --ctx)      [[ $# -ge 2 ]] || die "$1 needs a value"; CTX="$2"; shift 2 ;;
+      --ctx=*)    CTX="${1#*=}"; shift ;;
+      --no-pull)  PULL=0; shift ;;
+      -n|--dry-run) DRY_RUN=1; shift ;;
+      -h|--help)  usage; exit 0 ;;
+      -V|--version) echo "$PROG $VERSION"; exit 0 ;;
+      --)         shift; CLAUDE_ARGS=("$@"); break ;;
+      *)          die "unknown option '$1' (pass Claude Code arguments after --)" ;;
+    esac
+  done
+
+  [[ "$CTX" =~ ^[0-9]+$ ]] || die "--ctx must be a number"
+  HOST="$(normalize_host "$HOST")"
+
+  case "$sub" in
+    launch) cmd_launch ;;
+    doctor) cmd_doctor ;;
+    models) cmd_models ;;
+    config) cmd_config ;;
+  esac
+}
+
+main "$@"

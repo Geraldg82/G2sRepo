@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    name: Shell scripts (lint + tests)
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install shellcheck; else sudo apt-get install -y shellcheck; fi
+      - name: shellcheck
+        run: shellcheck -S warning bin/ollama-claude install/install.sh docker/entrypoint.sh tests/run.sh
+      - name: Tests
+        run: bash tests/run.sh
+
+  powershell:
+    name: PowerShell scripts (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse scripts
+        shell: pwsh
+        run: |
+          foreach ($f in 'bin/ollama-claude.ps1', 'install/install.ps1') {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errs) | Out-Null
+            if ($errs) { $errs | Format-List; throw "parse errors in $f" }
+          }
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path bin/ollama-claude.ps1, install/install.ps1 -Severity Error
+          if ($r) { $r | Format-Table; throw 'PSScriptAnalyzer errors' }
+      - name: Launcher smoke tests
+        shell: pwsh
+        run: |
+          $env:OLLAMA_CLAUDE_CONFIG = Join-Path $env:RUNNER_TEMP 'cfg'
+          $out = ./bin/ollama-claude.ps1 -Command config | Out-String
+          if ($out -notmatch 'HOST=http://localhost:11434') { throw "config: $out" }
+          $out = ./bin/ollama-claude.ps1 -Model qwen3.5 -DryRun | Out-String
+          if ($out -notmatch "ANTHROPIC_BASE_URL = 'http://localhost:11434'" -or $out -notmatch 'claude --model qwen3.5') { throw "dry run: $out" }
+          $env:OLLAMA_API_KEY = 'sk-test'
+          $out = ./bin/ollama-claude.ps1 -Cloud -Model glm-5.3-flash:cloud -DryRun | Out-String
+          if ($out -match 'sk-test' -or $out -notmatch 'https://ollama.com' -or $out -notmatch 'claude --model glm-5.3-flash$') { throw "cloud dry run: $out" }
+          $env:OLLAMA_HOST = '0.0.0.0'
+          $out = ./bin/ollama-claude.ps1 -Command config | Out-String
+          if ($out -notmatch 'HOST=http://localhost:11434') { throw "host normalisation: $out" }
+          'PowerShell smoke tests passed'
+
+  docker:
+    name: Docker image + compose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose files
+        run: docker compose -f docker-compose.yml -f docker-compose.gpu.yml config -q
+      - name: Build image
+        run: docker compose --profile cli build claude
+      - name: Claude Code is installed in the image
+        run: docker compose --profile cli run --rm --no-deps -T --entrypoint claude claude --version
+      - name: Launcher dry run inside the image
+        run: docker compose --profile cli run --rm --no-deps -T --entrypoint ollama-claude claude -n -m qwen3.5
